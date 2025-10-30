@@ -29,6 +29,7 @@ export const Dashboard = () => {
   const { gamepads, selectedGamepadIndex, setSelectedGamepadIndex, gamepadState } = useGamepad();
   const lastSentState = useRef<{ [key: number]: boolean }>({});
   const lastAxisValues = useRef<{ [key: number]: number }>({});
+  const gamepadStateRef = useRef(gamepadState);
 
   // Load config from URL on mount
   useEffect(() => {
@@ -47,6 +48,11 @@ export const Dashboard = () => {
       alert(`Loaded shared config: "${urlConfig.name}"`);
     }
   }, []);
+
+  // Keep gamepadStateRef updated
+  useEffect(() => {
+    gamepadStateRef.current = gamepadState;
+  }, [gamepadState]);
 
   const handleConnect = async () => {
     try {
@@ -92,86 +98,97 @@ export const Dashboard = () => {
     setCurrentValues(values);
   }, [gamepadState, mappings]);
 
-  // Send data - supports both interval-based and change-detection modes
+  // Helper function to send payload
+  const sendPayload = useCallback((payload: any) => {
+    if (!natsConnection) return;
+    try {
+      natsConnection.publish(subject, new TextEncoder().encode(JSON.stringify(payload)));
+      console.log('Published:', payload);
+      setLastMessage(payload);
+    } catch (err) {
+      console.error('Failed to publish:', err);
+    }
+  }, [natsConnection, subject]);
+
+  // Helper function to build payload from current gamepad state
+  const buildPayload = useCallback(() => {
+    const currentState = gamepadStateRef.current;
+    if (!currentState) return null;
+
+    const deadZone = 0.05;
+    const payload: any = {};
+
+    mappings.forEach((mapping) => {
+      if (mapping.type === 'button') {
+        const isPressed = currentState.buttons[mapping.index];
+        payload[mapping.fieldName] = isPressed ? 1 : 0;
+      } else if (mapping.type === 'axis') {
+        const rawValue = currentState.axes[mapping.index] || 0;
+        const currentValue = Math.abs(rawValue) < deadZone ? 0 : rawValue;
+        payload[mapping.fieldName] = parseFloat(currentValue.toFixed(2));
+      }
+    });
+
+    return payload;
+  }, [mappings]);
+
+  // Interval-based mode: send at fixed Hz rate
   useEffect(() => {
-    if (!isStreaming || !natsConnection || !gamepadState || mappings.length === 0) {
+    if (!isStreaming || !sendByInterval || mappings.length === 0) {
       return;
     }
 
-    const deadZone = 0.05; // Small deadzone to filter noise
-
-    // Helper function to build payload
-    const buildPayload = () => {
-      const payload: any = {};
-      mappings.forEach((mapping) => {
-        if (mapping.type === 'button') {
-          const isPressed = gamepadState.buttons[mapping.index];
-          payload[mapping.fieldName] = isPressed ? 1 : 0;
-        } else if (mapping.type === 'axis') {
-          const rawValue = gamepadState.axes[mapping.index] || 0;
-          const currentValue = Math.abs(rawValue) < deadZone ? 0 : rawValue;
-          payload[mapping.fieldName] = parseFloat(currentValue.toFixed(2));
-        }
-      });
-      return payload;
-    };
-
-    // Helper function to send payload
-    const sendPayload = (payload: any) => {
-      try {
-        natsConnection.publish(subject, new TextEncoder().encode(JSON.stringify(payload)));
-        console.log('Published:', payload);
-        setLastMessage(payload);
-      } catch (err) {
-        console.error('Failed to publish:', err);
-      }
-    };
-
-    if (sendByInterval) {
-      // Interval-based mode: send at fixed Hz rate
-      const intervalMs = 1000 / sendHz;
-      const intervalId = setInterval(() => {
-        const payload = buildPayload();
-        sendPayload(payload);
-      }, intervalMs);
-
-      return () => {
-        clearInterval(intervalId);
-      };
-    } else {
-      // Change-detection mode: send only when values change
-      let hasChange = false;
-      const payload: any = {};
-
-      mappings.forEach((mapping) => {
-        if (mapping.type === 'button') {
-          const isPressed = gamepadState.buttons[mapping.index];
-          const wasPressed = lastSentState.current[mapping.index];
-
-          if (isPressed !== wasPressed) {
-            hasChange = true;
-            lastSentState.current[mapping.index] = isPressed;
-          }
-          payload[mapping.fieldName] = isPressed ? 1 : 0;
-
-        } else if (mapping.type === 'axis') {
-          const rawValue = gamepadState.axes[mapping.index] || 0;
-          const lastValue = lastAxisValues.current[mapping.index];
-          const currentValue = Math.abs(rawValue) < deadZone ? 0 : rawValue;
-
-          if (lastValue === undefined || currentValue !== lastValue) {
-            hasChange = true;
-            lastAxisValues.current[mapping.index] = currentValue;
-          }
-          payload[mapping.fieldName] = parseFloat(currentValue.toFixed(2));
-        }
-      });
-
-      if (hasChange) {
+    const intervalMs = 1000 / sendHz;
+    const intervalId = setInterval(() => {
+      const payload = buildPayload();
+      if (payload) {
         sendPayload(payload);
       }
+    }, intervalMs);
+
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [isStreaming, sendByInterval, sendHz, mappings.length, buildPayload, sendPayload]);
+
+  // Change-detection mode: send only when values change
+  useEffect(() => {
+    if (!isStreaming || sendByInterval || !gamepadState || mappings.length === 0) {
+      return;
     }
-  }, [gamepadState, natsConnection, mappings, subject, isStreaming, sendHz, sendByInterval]);
+
+    const deadZone = 0.05;
+    let hasChange = false;
+    const payload: any = {};
+
+    mappings.forEach((mapping) => {
+      if (mapping.type === 'button') {
+        const isPressed = gamepadState.buttons[mapping.index];
+        const wasPressed = lastSentState.current[mapping.index];
+
+        if (isPressed !== wasPressed) {
+          hasChange = true;
+          lastSentState.current[mapping.index] = isPressed;
+        }
+        payload[mapping.fieldName] = isPressed ? 1 : 0;
+
+      } else if (mapping.type === 'axis') {
+        const rawValue = gamepadState.axes[mapping.index] || 0;
+        const lastValue = lastAxisValues.current[mapping.index];
+        const currentValue = Math.abs(rawValue) < deadZone ? 0 : rawValue;
+
+        if (lastValue === undefined || currentValue !== lastValue) {
+          hasChange = true;
+          lastAxisValues.current[mapping.index] = currentValue;
+        }
+        payload[mapping.fieldName] = parseFloat(currentValue.toFixed(2));
+      }
+    });
+
+    if (hasChange) {
+      sendPayload(payload);
+    }
+  }, [gamepadState, isStreaming, sendByInterval, mappings, sendPayload]);
 
   const addMapping = (type: 'button' | 'axis', index: number, fieldName: string) => {
     if (!fieldName.trim()) return;
