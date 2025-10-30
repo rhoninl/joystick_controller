@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { connect, NatsConnection } from 'nats.ws';
 import { useGamepad } from '../hooks/useGamepad';
 import { ConfigPanel } from './ConfigPanel';
