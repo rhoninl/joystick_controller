@@ -9,6 +9,8 @@ export interface GamepadConfig {
   natsUrl: string;
   subject: string;
   mappings: FieldMapping[];
+  sendHz?: number; // Optional for backward compatibility
+  sendByInterval?: boolean; // Optional for backward compatibility
   createdAt: number;
 }
 

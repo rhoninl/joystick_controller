@@ -3,6 +3,8 @@ import { connect, NatsConnection } from 'nats.ws';
 import { useGamepad } from '../hooks/useGamepad';
 import { ConfigPanel } from './ConfigPanel';
 import { configManager, GamepadConfig } from '../utils/configManager';
+import { TWallpaper } from '@twallpaper/react';
+import '@twallpaper/react/css';
 
 interface FieldMapping {
   type: 'button' | 'axis';
@@ -20,6 +22,9 @@ export const Dashboard = () => {
   const [mappings, setMappings] = useState<FieldMapping[]>([]);
   const [lastMessage, setLastMessage] = useState<any>(null);
   const [currentValues, setCurrentValues] = useState<{ [key: string]: any }>({});
+  const [sendHz, setSendHz] = useState(2); // Default to 2 Hz
+  const [sendByInterval, setSendByInterval] = useState(false); // Default to change-detection
+  const [isConfigDrawerOpen, setIsConfigDrawerOpen] = useState(false);
 
   const { gamepads, selectedGamepadIndex, setSelectedGamepadIndex, gamepadState } = useGamepad();
   const lastSentState = useRef<{ [key: number]: boolean }>({});
@@ -32,6 +37,12 @@ export const Dashboard = () => {
       setNatsUrl(urlConfig.natsUrl);
       setSubject(urlConfig.subject);
       setMappings(urlConfig.mappings);
+      if (urlConfig.sendHz !== undefined) {
+        setSendHz(urlConfig.sendHz);
+      }
+      if (urlConfig.sendByInterval !== undefined) {
+        setSendByInterval(urlConfig.sendByInterval);
+      }
       configManager.clearUrlConfig();
       alert(`Loaded shared config: "${urlConfig.name}"`);
     }
@@ -81,47 +92,32 @@ export const Dashboard = () => {
     setCurrentValues(values);
   }, [gamepadState, mappings]);
 
-  // Send data when buttons pressed or axes moved
+  // Send data - supports both interval-based and change-detection modes
   useEffect(() => {
     if (!isStreaming || !natsConnection || !gamepadState || mappings.length === 0) {
       return;
     }
 
-    let hasChange = false;
-    const payload: any = {};
     const deadZone = 0.05; // Small deadzone to filter noise
 
-    // Check all mappings for changes
-    mappings.forEach((mapping) => {
-      if (mapping.type === 'button') {
-        const isPressed = gamepadState.buttons[mapping.index];
-        const wasPressed = lastSentState.current[mapping.index];
-
-        if (isPressed !== wasPressed) {
-          hasChange = true;
-          lastSentState.current[mapping.index] = isPressed;
+    // Helper function to build payload
+    const buildPayload = () => {
+      const payload: any = {};
+      mappings.forEach((mapping) => {
+        if (mapping.type === 'button') {
+          const isPressed = gamepadState.buttons[mapping.index];
+          payload[mapping.fieldName] = isPressed ? 1 : 0;
+        } else if (mapping.type === 'axis') {
+          const rawValue = gamepadState.axes[mapping.index] || 0;
+          const currentValue = Math.abs(rawValue) < deadZone ? 0 : rawValue;
+          payload[mapping.fieldName] = parseFloat(currentValue.toFixed(2));
         }
-        payload[mapping.fieldName] = isPressed ? 1 : 0;
+      });
+      return payload;
+    };
 
-      } else if (mapping.type === 'axis') {
-        const rawValue = gamepadState.axes[mapping.index] || 0;
-        const lastValue = lastAxisValues.current[mapping.index];
-
-        // Apply deadzone - treat small values as 0
-        const currentValue = Math.abs(rawValue) < deadZone ? 0 : rawValue;
-
-        // Send if value changed at all (including returning to 0)
-        if (lastValue === undefined || currentValue !== lastValue) {
-          hasChange = true;
-          lastAxisValues.current[mapping.index] = currentValue;
-        }
-
-        payload[mapping.fieldName] = parseFloat(currentValue.toFixed(2));
-      }
-    });
-
-    // Always send data if any value changed
-    if (hasChange) {
+    // Helper function to send payload
+    const sendPayload = (payload: any) => {
       try {
         natsConnection.publish(subject, new TextEncoder().encode(JSON.stringify(payload)));
         console.log('Published:', payload);
@@ -129,8 +125,53 @@ export const Dashboard = () => {
       } catch (err) {
         console.error('Failed to publish:', err);
       }
+    };
+
+    if (sendByInterval) {
+      // Interval-based mode: send at fixed Hz rate
+      const intervalMs = 1000 / sendHz;
+      const intervalId = setInterval(() => {
+        const payload = buildPayload();
+        sendPayload(payload);
+      }, intervalMs);
+
+      return () => {
+        clearInterval(intervalId);
+      };
+    } else {
+      // Change-detection mode: send only when values change
+      let hasChange = false;
+      const payload: any = {};
+
+      mappings.forEach((mapping) => {
+        if (mapping.type === 'button') {
+          const isPressed = gamepadState.buttons[mapping.index];
+          const wasPressed = lastSentState.current[mapping.index];
+
+          if (isPressed !== wasPressed) {
+            hasChange = true;
+            lastSentState.current[mapping.index] = isPressed;
+          }
+          payload[mapping.fieldName] = isPressed ? 1 : 0;
+
+        } else if (mapping.type === 'axis') {
+          const rawValue = gamepadState.axes[mapping.index] || 0;
+          const lastValue = lastAxisValues.current[mapping.index];
+          const currentValue = Math.abs(rawValue) < deadZone ? 0 : rawValue;
+
+          if (lastValue === undefined || currentValue !== lastValue) {
+            hasChange = true;
+            lastAxisValues.current[mapping.index] = currentValue;
+          }
+          payload[mapping.fieldName] = parseFloat(currentValue.toFixed(2));
+        }
+      });
+
+      if (hasChange) {
+        sendPayload(payload);
+      }
     }
-  }, [gamepadState, natsConnection, mappings, subject, isStreaming]);
+  }, [gamepadState, natsConnection, mappings, subject, isStreaming, sendHz, sendByInterval]);
 
   const addMapping = (type: 'button' | 'axis', index: number, fieldName: string) => {
     if (!fieldName.trim()) return;
@@ -155,23 +196,67 @@ export const Dashboard = () => {
     setNatsUrl(config.natsUrl);
     setSubject(config.subject);
     setMappings(config.mappings);
+    if (config.sendHz !== undefined) {
+      setSendHz(config.sendHz);
+    }
+    if (config.sendByInterval !== undefined) {
+      setSendByInterval(config.sendByInterval);
+    }
     alert(`Loaded config: "${config.name}"`);
   };
 
   return (
-    <div className="min-h-screen bg-gray-100 p-6">
-      <div className="max-w-6xl mx-auto space-y-6">
-        <h1 className="text-4xl font-bold text-gray-800">Joystick Controller</h1>
+    <div className="min-h-screen relative overflow-hidden p-8">
+      {/* Animated Wallpaper Background */}
+      <TWallpaper
+        options={{
+          colors: [
+            '#818cf8', // indigo-400
+            '#c084fc', // purple-400
+            '#f472b6', // pink-400
+            '#60a5fa'  // blue-400
+          ],
+          animate: true,
+          scrollAnimate: true,
+          pattern: {
+            image: "https://twallpaper.js.org/patterns/games.svg",
+            background: "#000",
+            size: "800px",
+          }
+        }}
+      />
+
+      {/* Content */}
+      <div className="max-w-7xl mx-auto space-y-8 relative z-10">
+        {/* Header */}
+        <div className="bg-white rounded-2xl shadow-lg p-6 animate-fadeIn">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-4xl font-bold bg-gradient-to-r from-indigo-600 to-purple-600 bg-clip-text text-transparent">
+                Joystick Controller
+              </h1>
+              <p className="text-slate-500 mt-1">Real-time gamepad data streaming via NATS</p>
+            </div>
+            <button
+              onClick={() => setIsConfigDrawerOpen(true)}
+              className="px-6 py-3 bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-xl hover:from-indigo-600 hover:to-purple-600 font-medium shadow-md hover:shadow-lg transition-all duration-200 btn-press hover-lift cursor-pointer"
+            >
+              ⚙️ Configuration
+            </button>
+          </div>
+        </div>
 
         <div className="grid grid-cols-2 gap-6">
           {/* Left Column */}
           <div className="space-y-6">
             {/* NATS Connection */}
-            <div className="bg-white rounded-lg shadow p-6">
-              <h2 className="text-2xl font-bold mb-4">NATS Connection</h2>
-              <div className="space-y-3">
+            <div className="bg-white rounded-2xl shadow-lg p-6 hover:shadow-xl transition-all duration-200 animate-slideInUp">
+              <h2 className="text-2xl font-bold mb-6 text-slate-800 flex items-center gap-2">
+                <span className="text-2xl">🔌</span> Connection
+              </h2>
+              <div className="space-y-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">
                     WebSocket URL
                   </label>
                   <input
@@ -180,11 +265,11 @@ export const Dashboard = () => {
                     onChange={(e) => setNatsUrl(e.target.value)}
                     disabled={isConnected}
                     placeholder="ws://localhost:9222"
-                    className="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+                    className="w-full px-4 py-2.5 border-2 border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-slate-50 disabled:text-slate-500 transition-all"
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">
                     Subject
                   </label>
                   <input
@@ -193,76 +278,123 @@ export const Dashboard = () => {
                     onChange={(e) => setSubject(e.target.value)}
                     disabled={isStreaming}
                     placeholder="joystick.data"
-                    className="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+                    className="w-full px-4 py-2.5 border-2 border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-slate-50 disabled:text-slate-500 transition-all"
                   />
                 </div>
+                <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
+                  <div className="flex items-center gap-3 mb-3">
+                    <input
+                      type="checkbox"
+                      id="sendByInterval"
+                      checked={sendByInterval}
+                      onChange={(e) => setSendByInterval(e.target.checked)}
+                      disabled={isStreaming}
+                      className="w-5 h-5 text-indigo-600 border-slate-300 rounded focus:ring-indigo-500 disabled:opacity-50 cursor-pointer"
+                    />
+                    <label htmlFor="sendByInterval" className="text-sm font-semibold text-slate-700 cursor-pointer">
+                      📡 Send by interval
+                    </label>
+                  </div>
+                  {sendByInterval && (
+                    <div className="mt-3 pl-8">
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">
+                        Send Frequency (Hz)
+                      </label>
+                      <input
+                        type="number"
+                        value={sendHz}
+                        onChange={(e) => setSendHz(Math.max(1, Math.min(100, Number(e.target.value))))}
+                        disabled={isStreaming}
+                        min="1"
+                        max="100"
+                        placeholder="2"
+                        className="w-full px-4 py-2.5 border-2 border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-slate-100 disabled:text-slate-500 transition-all"
+                      />
+                      <p className="text-xs text-slate-500 mt-2 flex items-center gap-1">
+                        ⚡ Sends {sendHz}x per second
+                      </p>
+                    </div>
+                  )}
+                  {!sendByInterval && (
+                    <p className="text-xs text-slate-500 pl-8 flex items-center gap-1">
+                      ⚡ Sends only when values change
+                    </p>
+                  )}
+                </div>
 
-                <div className="flex items-center gap-4 pt-2">
+                <div className="flex items-center gap-3 pt-2">
                   {!isConnected ? (
                     <button
                       onClick={handleConnect}
-                      className="px-6 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 font-medium"
+                      className="flex-1 px-6 py-3 bg-gradient-to-r from-emerald-500 to-teal-500 text-white rounded-xl hover:from-emerald-600 hover:to-teal-600 font-semibold shadow-md hover:shadow-lg transition-all duration-200 btn-press hover-lift cursor-pointer"
                     >
                       Connect
                     </button>
                   ) : (
                     <button
                       onClick={handleDisconnect}
-                      className="px-6 py-2 bg-red-500 text-white rounded hover:bg-red-600 font-medium"
+                      className="flex-1 px-6 py-3 bg-gradient-to-r from-red-500 to-pink-500 text-white rounded-xl hover:from-red-600 hover:to-pink-600 font-semibold shadow-md hover:shadow-lg transition-all duration-200 btn-press hover-lift cursor-pointer"
                     >
                       Disconnect
                     </button>
                   )}
 
-                  <div className="flex items-center gap-2">
+                  <div className={`flex items-center gap-2 px-4 py-3 rounded-xl border-2 ${isConnected ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-100 border-slate-200'
+                    }`}>
                     <div
-                      className={`w-3 h-3 rounded-full ${
-                        isConnected ? 'bg-green-500' : 'bg-gray-300'
-                      }`}
+                      className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+                        }`}
                     />
-                    <span className="text-sm font-medium text-gray-700">
+                    <span className={`text-sm font-semibold ${isConnected ? 'text-emerald-700' : 'text-slate-600'
+                      }`}>
                       {isConnected ? 'Connected' : 'Disconnected'}
                     </span>
                   </div>
                 </div>
 
                 {error && (
-                  <div className="p-3 bg-red-100 border border-red-300 rounded text-red-700 text-sm">
-                    {error}
+                  <div className="p-4 bg-red-50 border-2 border-red-200 rounded-xl text-red-700 text-sm font-medium">
+                    ⚠️ {error}
                   </div>
                 )}
               </div>
             </div>
 
             {/* Gamepad Selection */}
-            <div className="bg-white rounded-lg shadow p-6">
-              <h2 className="text-2xl font-bold mb-4">Select Gamepad</h2>
+            <div className="bg-white rounded-2xl shadow-lg p-6 hover:shadow-xl transition-all duration-200 animate-slideInUp" style={{ animationDelay: '0.1s' }}>
+              <h2 className="text-2xl font-bold mb-6 text-slate-800 flex items-center gap-2">
+                <span className="text-2xl">🎮</span> Select Gamepad
+              </h2>
               {gamepads.length === 0 ? (
-                <p className="text-gray-500 italic text-sm">
-                  No gamepads detected. Press any button on your gamepad.
-                </p>
+                <div className="text-center py-8 px-4 bg-slate-50 rounded-xl border-2 border-dashed border-slate-300">
+                  <p className="text-slate-500 text-sm">
+                    No gamepads detected
+                  </p>
+                  <p className="text-slate-400 text-xs mt-1">
+                    Press any button on your gamepad to connect
+                  </p>
+                </div>
               ) : (
-                <div className="space-y-2">
+                <div className="space-y-3">
                   {gamepads.map((gamepad) => (
                     <div
                       key={gamepad.index}
-                      className={`p-3 rounded border-2 cursor-pointer transition-colors ${
-                        selectedGamepadIndex === gamepad.index
-                          ? 'border-blue-500 bg-blue-50'
-                          : 'border-gray-200 hover:border-gray-400'
-                      }`}
+                      className={`p-4 rounded-xl border-2 cursor-pointer transition-all duration-200 ${selectedGamepadIndex === gamepad.index
+                        ? 'border-indigo-500 bg-gradient-to-r from-indigo-50 to-purple-50 shadow-md'
+                        : 'border-slate-200 hover:border-slate-300 hover:shadow-md'
+                        }`}
                       onClick={() => setSelectedGamepadIndex(gamepad.index)}
                     >
                       <div className="flex items-center justify-between">
                         <div>
-                          <p className="font-semibold text-sm">{gamepad.id}</p>
-                          <p className="text-xs text-gray-500">
-                            {gamepad.buttons.length} buttons, {gamepad.axes.length} axes
+                          <p className="font-semibold text-sm text-slate-800">{gamepad.id}</p>
+                          <p className="text-xs text-slate-500 mt-1">
+                            {gamepad.buttons.length} buttons • {gamepad.axes.length} axes
                           </p>
                         </div>
                         {selectedGamepadIndex === gamepad.index && (
-                          <span className="px-2 py-1 bg-blue-500 text-white rounded text-xs font-medium">
-                            Selected
+                          <span className="px-3 py-1.5 bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-lg text-xs font-semibold shadow-sm">
+                            ✓ Selected
                           </span>
                         )}
                       </div>
@@ -274,24 +406,31 @@ export const Dashboard = () => {
 
             {/* Streaming Control */}
             {selectedGamepadIndex !== null && (
-              <div className="bg-white rounded-lg shadow p-6">
-                <h2 className="text-2xl font-bold mb-4">Streaming</h2>
+              <div className="bg-white rounded-2xl shadow-lg p-6 hover:shadow-xl transition-all duration-200 animate-slideInUp" style={{ animationDelay: '0.2s' }}>
+                <h2 className="text-2xl font-bold mb-6 text-slate-800 flex items-center gap-2">
+                  <span className="text-2xl">📡</span> Streaming
+                </h2>
                 <button
                   onClick={() => setIsStreaming(!isStreaming)}
                   disabled={!isConnected || mappings.length === 0}
-                  className={`w-full px-6 py-3 rounded font-medium text-lg ${
-                    isStreaming
-                      ? 'bg-orange-500 hover:bg-orange-600 text-white'
-                      : 'bg-green-500 hover:bg-green-600 text-white disabled:bg-gray-300 disabled:cursor-not-allowed'
-                  }`}
+                  className={`w-full px-6 py-4 rounded-xl font-bold text-lg shadow-lg transition-all duration-200 btn-press hover-lift cursor-pointer ${isStreaming
+                    ? 'bg-gradient-to-r from-orange-500 to-red-500 hover:from-orange-600 hover:to-red-600 text-white hover:shadow-xl animate-pulse'
+                    : 'bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white disabled:from-slate-300 disabled:to-slate-300 disabled:cursor-not-allowed disabled:shadow-none'
+                    }`}
                 >
-                  {isStreaming ? 'Stop Streaming' : 'Start Streaming'}
+                  {isStreaming ? '⏹ Stop Streaming' : '▶ Start Streaming'}
                 </button>
                 {!isConnected && (
-                  <p className="text-yellow-600 mt-2 text-sm">Connect to NATS first</p>
+                  <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-700 text-sm flex items-center gap-2">
+                    <span>⚠️</span>
+                    <span>Connect to NATS first</span>
+                  </div>
                 )}
                 {mappings.length === 0 && (
-                  <p className="text-yellow-600 mt-2 text-sm">Add field mappings first</p>
+                  <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-700 text-sm flex items-center gap-2">
+                    <span>⚠️</span>
+                    <span>Add field mappings first</span>
+                  </div>
                 )}
               </div>
             )}
@@ -301,37 +440,43 @@ export const Dashboard = () => {
           <div className="space-y-6">
             {/* Field Mappings Configuration */}
             {selectedGamepadIndex !== null && gamepadState && (
-              <div className="bg-white rounded-lg shadow p-6">
-                <h2 className="text-2xl font-bold mb-4">Field Mappings</h2>
+              <div className="bg-white rounded-2xl shadow-lg p-6 hover:shadow-xl transition-all duration-200 animate-slideInUp">
+                <h2 className="text-2xl font-bold mb-6 text-slate-800 flex items-center gap-2">
+                  <span className="text-2xl">🗺️</span> Field Mappings
+                </h2>
 
-                <div className="space-y-4 max-h-96 overflow-y-auto">
-                  <p className="text-sm text-gray-500 italic mb-3">
-                    Press buttons or move axes to identify them
-                  </p>
+                <div className="space-y-5 max-h-96 overflow-y-auto pr-2">
+                  <div className="bg-blue-50 border border-blue-200 rounded-xl p-3">
+                    <p className="text-sm text-blue-700 flex items-center gap-2">
+                      <span>💡</span>
+                      <span>Press buttons or move axes to identify them</span>
+                    </p>
+                  </div>
 
                   {/* Buttons */}
                   <div>
-                    <h3 className="font-semibold text-gray-700 mb-2">Buttons</h3>
+                    <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2">
+                      <span>🔘</span> Buttons
+                    </h3>
                     <div className="space-y-2">
                       {gamepadState.buttons.map((isPressed, index) => {
                         const mapping = getMapping('button', index);
                         return (
                           <div
                             key={`btn-${index}`}
-                            className={`flex items-center gap-2 p-2 rounded transition-colors ${
-                              isPressed ? 'bg-green-100 border-2 border-green-500' : 'bg-white border-2 border-transparent'
-                            }`}
+                            className={`flex items-center gap-2 p-3 rounded-xl border-2 transition-all duration-150 ${isPressed
+                              ? 'bg-gradient-to-r from-emerald-50 to-green-50 border-emerald-400 shadow-md'
+                              : 'bg-slate-50 border-slate-200 hover:border-slate-300'
+                              }`}
                           >
-                            <div className="flex items-center gap-2 w-24">
+                            <div className="flex items-center gap-2 w-20">
                               <div
-                                className={`w-3 h-3 rounded-full ${
-                                  isPressed ? 'bg-green-500' : 'bg-gray-300'
-                                }`}
+                                className={`w-3 h-3 rounded-full transition-all ${isPressed ? 'bg-emerald-500 scale-110 shadow-sm' : 'bg-slate-300'
+                                  }`}
                               />
-                              <span className={`text-sm font-medium ${
-                                isPressed ? 'text-green-700' : 'text-gray-600'
-                              }`}>
-                                Btn {index}
+                              <span className={`text-xs font-bold ${isPressed ? 'text-emerald-700' : 'text-slate-600'
+                                }`}>
+                                B{index}
                               </span>
                             </div>
                             <input
@@ -345,12 +490,12 @@ export const Dashboard = () => {
                                   removeMapping('button', index);
                                 }
                               }}
-                              className="flex-1 px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                              className="flex-1 px-3 py-1.5 border-2 border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white"
                             />
                             {mapping && (
                               <button
                                 onClick={() => removeMapping('button', index)}
-                                className="px-2 py-1 bg-red-500 text-white rounded text-xs hover:bg-red-600"
+                                className="px-2 py-1 bg-gradient-to-r from-red-500 to-pink-500 text-white rounded-lg text-xs font-semibold hover:from-red-600 hover:to-pink-600 transition-all shadow-sm hover:shadow-md cursor-pointer"
                               >
                                 ✕
                               </button>
@@ -364,7 +509,9 @@ export const Dashboard = () => {
                   {/* Axes */}
                   {gamepadState.axes.length > 0 && (
                     <div>
-                      <h3 className="font-semibold text-gray-700 mb-2">Axes</h3>
+                      <h3 className="font-bold text-slate-700 mb-3 flex items-center gap-2">
+                        <span>🎚️</span> Axes
+                      </h3>
                       <div className="space-y-2">
                         {gamepadState.axes.map((axisValue, index) => {
                           const mapping = getMapping('axis', index);
@@ -372,18 +519,19 @@ export const Dashboard = () => {
                           return (
                             <div
                               key={`axis-${index}`}
-                              className={`flex items-center gap-2 p-2 rounded transition-colors ${
-                                isMoving ? 'bg-blue-100 border-2 border-blue-500' : 'bg-white border-2 border-transparent'
-                              }`}
+                              className={`flex items-center gap-2 p-3 rounded-xl border-2 transition-all duration-150 ${isMoving
+                                ? 'bg-gradient-to-r from-blue-50 to-indigo-50 border-blue-400 shadow-md'
+                                : 'bg-slate-50 border-slate-200 hover:border-slate-300'
+                                }`}
                             >
-                              <div className="flex items-center gap-2 w-24">
-                                <div className="text-sm font-mono text-gray-600 w-12 text-right">
+                              <div className="flex items-center gap-2 w-20">
+                                <div className={`text-xs font-mono font-bold w-12 text-right ${isMoving ? 'text-blue-600' : 'text-slate-600'
+                                  }`}>
                                   {axisValue.toFixed(2)}
                                 </div>
-                                <span className={`text-sm font-medium ${
-                                  isMoving ? 'text-blue-700' : 'text-gray-600'
-                                }`}>
-                                  Ax {index}
+                                <span className={`text-xs font-bold ${isMoving ? 'text-blue-700' : 'text-slate-600'
+                                  }`}>
+                                  A{index}
                                 </span>
                               </div>
                               <input
@@ -397,12 +545,12 @@ export const Dashboard = () => {
                                     removeMapping('axis', index);
                                   }
                                 }}
-                                className="flex-1 px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                className="flex-1 px-3 py-1.5 border-2 border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white"
                               />
                               {mapping && (
                                 <button
                                   onClick={() => removeMapping('axis', index)}
-                                  className="px-2 py-1 bg-red-500 text-white rounded text-xs hover:bg-red-600"
+                                  className="px-2 py-1 bg-gradient-to-r from-red-500 to-pink-500 text-white rounded-lg text-xs font-semibold hover:from-red-600 hover:to-pink-600 transition-all shadow-sm hover:shadow-md cursor-pointer"
                                 >
                                   ✕
                                 </button>
@@ -419,13 +567,15 @@ export const Dashboard = () => {
 
             {/* Current Values */}
             {Object.keys(currentValues).length > 0 && (
-              <div className="bg-white rounded-lg shadow p-6">
-                <h2 className="text-2xl font-bold mb-4">Current Values</h2>
+              <div className="bg-white rounded-2xl shadow-lg p-6 hover:shadow-xl transition-all duration-200 animate-slideInUp" style={{ animationDelay: '0.1s' }}>
+                <h2 className="text-2xl font-bold mb-6 text-slate-800 flex items-center gap-2">
+                  <span className="text-2xl">📊</span> Current Values
+                </h2>
                 <div className="space-y-2">
                   {Object.entries(currentValues).map(([key, value]) => (
-                    <div key={key} className="flex justify-between items-center p-2 bg-gray-50 rounded">
-                      <span className="font-medium text-gray-700">{key}:</span>
-                      <span className="font-mono text-blue-600">{value}</span>
+                    <div key={key} className="flex justify-between items-center p-3 bg-gradient-to-r from-slate-50 to-slate-100 rounded-xl border border-slate-200 hover:shadow-sm transition-shadow">
+                      <span className="font-semibold text-slate-700">{key}</span>
+                      <span className="font-mono font-bold text-indigo-600 bg-white px-3 py-1 rounded-lg shadow-sm">{value}</span>
                     </div>
                   ))}
                 </div>
@@ -434,9 +584,11 @@ export const Dashboard = () => {
 
             {/* Last Message Sent */}
             {lastMessage && (
-              <div className="bg-white rounded-lg shadow p-6">
-                <h2 className="text-2xl font-bold mb-4">Last Message Sent</h2>
-                <pre className="bg-gray-900 text-green-400 p-4 rounded text-sm overflow-x-auto">
+              <div className="bg-white rounded-2xl shadow-lg p-6 hover:shadow-xl transition-all duration-200 animate-scaleIn">
+                <h2 className="text-2xl font-bold mb-6 text-slate-800 flex items-center gap-2">
+                  <span className="text-2xl">📤</span> Last Message Sent
+                </h2>
+                <pre className="bg-gray-900 text-emerald-400 p-5 rounded-xl text-sm overflow-x-auto shadow-inner font-mono animate-fadeIn">
                   {JSON.stringify(lastMessage, null, 2)}
                 </pre>
               </div>
@@ -447,7 +599,11 @@ export const Dashboard = () => {
               natsUrl={natsUrl}
               subject={subject}
               mappings={mappings}
+              sendHz={sendHz}
+              sendByInterval={sendByInterval}
               onLoadConfig={handleLoadConfig}
+              isOpen={isConfigDrawerOpen}
+              onClose={() => setIsConfigDrawerOpen(false)}
             />
           </div>
         </div>
